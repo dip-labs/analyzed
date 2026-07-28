@@ -125,6 +125,15 @@ fn run_shared_state(
         let Some(event) = event else {
             anyhow::bail!("client exited without proper shutdown sequence");
         };
+        // Deferred cone attach: the crate-graph change lands exactly when a
+        // SEMANTIC request needs it. Typing, syntax-only requests and
+        // background work never queue behind it.
+        if state.shared.cone_pending()
+            && let super::Event::Lsp(lsp_server::Message::Request(request)) = &event
+            && SEMANTIC_ATTACH_METHODS.contains(&request.method.as_str())
+        {
+            state.attach_pending_shared_cone();
+        }
         if matches!(
             &event,
             super::Event::Lsp(lsp_server::Message::Notification(lsp_server::Notification {
@@ -146,7 +155,69 @@ fn run_shared_state(
     anyhow::bail!("A receiver has been dropped, something panicked!")
 }
 
+/// Fleet daemons serving agent sessions (open -> query, no typing) can pay
+/// the crate-graph change at didOpen instead of the first semantic request:
+/// ANALYZED_EAGER_CONE_ATTACH=1 on the daemon restores the eager behavior.
+pub(crate) static EAGER_CONE_ATTACH: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var_os("ANALYZED_EAGER_CONE_ATTACH").is_some());
+
+/// Requests whose answers require the session's overlay crate cone. The
+/// deferred cone attach runs right before one of these; everything else
+/// (typing, onEnter, completion, highlighting) never waits for it.
+const SEMANTIC_ATTACH_METHODS: &[&str] = &[
+    "textDocument/definition",
+    "textDocument/declaration",
+    "textDocument/typeDefinition",
+    "textDocument/implementation",
+    "textDocument/references",
+    "textDocument/hover",
+    "textDocument/rename",
+    "textDocument/prepareRename",
+    "textDocument/documentHighlight",
+    "textDocument/prepareCallHierarchy",
+    "callHierarchy/incomingCalls",
+    "callHierarchy/outgoingCalls",
+    "workspace/symbol",
+];
+
 impl crate::global_state::GlobalState {
+    /// Attach a deferred overlay crate cone right before the first semantic
+    /// request that needs it; also where failed overlay syncs get retried.
+    pub(crate) fn attach_pending_shared_cone(&mut self) {
+        if !self.shared.cone_pending() {
+            return;
+        }
+        let shared = self.shared.clone();
+        let open_files = self
+            .mem_docs
+            .iter()
+            .filter_map(|path| {
+                let doc = self.mem_docs.get(path)?;
+                let text = std::str::from_utf8(&doc.data).ok()?.to_owned();
+                let (text, line_endings) = LineEndings::normalize(text);
+                Some((path.clone(), text, line_endings))
+            })
+            .collect::<Vec<_>>();
+        let overlay_files = match shared.prepare_overlay_files(open_files) {
+            Ok(files) => files,
+            Err(error) => {
+                tracing::warn!("deferred cone attach: prepare failed, will retry: {error}");
+                return;
+            }
+        };
+        match shared.sync_open_files(overlay_files, true) {
+            Ok(sync) => {
+                for file_id in sync.removed_files {
+                    self.diagnostics.clear_native_for(file_id);
+                }
+            }
+            Err(error) => {
+                tracing::warn!("deferred cone attach failed, will retry: {error}");
+                shared.set_cone_pending(true);
+            }
+        }
+    }
+
     pub(crate) fn process_shared_changes(&mut self) -> (bool, Option<Duration>) {
         let shared = self.shared.clone();
         let generation_changed = shared.config_generation_changed();
@@ -234,24 +305,39 @@ impl crate::global_state::GlobalState {
                 Ok(needed) => needed,
                 Err(error) => {
                     tracing::error!("failed to check shared analyzer overlay: {error}");
+                    shared.set_cone_pending(true);
                     return (false, None);
                 }
             };
             if overlay_needed {
-                let overlay_files = match shared.prepare_overlay_files(open_files) {
-                    Ok(files) => files,
-                    Err(error) => {
-                        tracing::error!(
-                            "failed to prepare shared analyzer overlay: {error}"
-                        );
-                        return (false, None);
+                // Cone expansion runs world queries under the world lock;
+                // only pay for it when the OPEN FILE SET changed. Plain text
+                // edits sync the open files directly (structural cone members
+                // are carried forward inside the sync).
+                let set_changed = shared.open_set_changed(&open_files);
+                let overlay_files = if set_changed {
+                    match shared.prepare_overlay_files(open_files) {
+                        Ok(files) => files,
+                        Err(error) => {
+                            tracing::error!(
+                                "failed to prepare shared analyzer overlay: {error}"
+                            );
+                            shared.set_cone_pending(true);
+                            return (false, None);
+                        }
                     }
+                } else {
+                    open_files
+                        .into_iter()
+                        .map(|(path, text, line_endings)| (path.clone(), path, text, line_endings))
+                        .collect()
                 };
                 let sync_start = Instant::now();
-                let sync = match shared.sync_open_files(overlay_files) {
+                let sync = match shared.sync_open_files(overlay_files, set_changed && *EAGER_CONE_ATTACH) {
                     Ok(sync) => sync,
                     Err(error) => {
                         tracing::error!("failed to sync shared analyzer overlay: {error}");
+                        shared.set_cone_pending(true);
                         return (false, None);
                     }
                 };

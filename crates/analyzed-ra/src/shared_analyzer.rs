@@ -1097,11 +1097,20 @@ struct SharedAnalyzerRuntimeSession {
     gc: Option<Arc<SharedAnalyzerGcCoordinator>>,
     id: u64,
     busy: AtomicBool,
+    /// A session overlay exists whose crate cone has not been attached yet
+    /// (deferred to the session's idle turn so interactive edits never pay
+    /// for the crate-graph change). Also set when an overlay sync failed and
+    /// must be retried.
+    cone_pending: AtomicBool,
     input_generation: Arc<AtomicU64>,
     config_generation_seen: AtomicU64,
     workspace_indexes: Vec<usize>,
     excluded_paths: Vec<String>,
     line_endings: Mutex<SharedLineEndings>,
+    /// Path keys of the mem-docs as of the last overlay sync: cone expansion
+    /// (world queries under the world lock) only reruns when this SET
+    /// changes; plain text edits sync the open files directly.
+    last_open_set: Mutex<BTreeSet<String>>,
     file_mappings: Mutex<SharedFileMappings>,
     analysis_cache: Mutex<SharedAnalysisCache>,
     registry_lease: Option<SharedAnalyzerRegistryLease>,
@@ -1195,11 +1204,13 @@ impl SharedAnalyzerRuntime {
             gc,
             id,
             busy: AtomicBool::new(registry_lease.is_some()),
+            cone_pending: AtomicBool::new(false),
             input_generation,
             config_generation_seen: AtomicU64::new(u64::MAX),
             workspace_indexes,
             excluded_paths,
             line_endings: Mutex::new(SharedLineEndings::default()),
+            last_open_set: Mutex::new(BTreeSet::new()),
             file_mappings: Mutex::new(SharedFileMappings::default()),
             analysis_cache: Mutex::new(SharedAnalysisCache::default()),
             registry_lease,
@@ -1212,6 +1223,31 @@ impl SharedAnalyzerRuntime {
 
     fn session_id(&self) -> u64 {
         self.session.id
+    }
+
+    pub(crate) fn open_set_changed(&self, files: &[(VfsPath, String, crate::line_index::LineEndings)]) -> bool {
+        let keys = files
+            .iter()
+            .map(|(path, _, _)| path_key(&normalize_vfs_path(path)))
+            .collect::<BTreeSet<_>>();
+        let mut last = self
+            .session
+            .last_open_set
+            .lock()
+            .expect("shared analyzer open set mutex poisoned");
+        if *last == keys {
+            return false;
+        }
+        *last = keys;
+        true
+    }
+
+    pub(crate) fn cone_pending(&self) -> bool {
+        self.session.cone_pending.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn set_cone_pending(&self, pending: bool) {
+        self.session.cone_pending.store(pending, Ordering::SeqCst);
     }
 
     pub(crate) fn set_busy(&self, busy: bool) {
@@ -1419,13 +1455,22 @@ impl SharedAnalyzerRuntime {
             String,
             crate::line_index::LineEndings,
         )>,
+        allow_attach: bool,
     ) -> anyhow::Result<SharedOverlaySync> {
         let _write = self.session.access.write(Some(self.session_id()));
         let mut world = self
             .world
             .lock()
             .map_err(|error| anyhow::format_err!("shared world mutex is poisoned: {error}"))?;
-        let sync = world.sync_session_overlay(self.session_id(), self.workspace_indexes(), files)?;
+        let sync = world.sync_session_overlay(
+            self.session_id(),
+            self.workspace_indexes(),
+            files,
+            allow_attach,
+        )?;
+        self.session
+            .cone_pending
+            .store(sync.cone_pending, Ordering::SeqCst);
         if sync.changed {
             if let Some(gc) = &self.session.gc {
                 gc.changed();
@@ -1808,6 +1853,9 @@ impl SessionOverlayCrate {
 pub(crate) struct SharedOverlaySync {
     pub(crate) changed: bool,
     pub(crate) removed_files: Vec<FileId>,
+    /// The overlay has modified files but no attached crate cone yet; the
+    /// session should attach it on its next idle turn.
+    pub(crate) cone_pending: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1854,6 +1902,10 @@ struct ActiveOverlayFile {
     display_path: VfsPath,
     text: String,
     line_endings: crate::line_index::LineEndings,
+    /// Identical-to-base cone member kept so the overlay crate's module tree
+    /// stays complete (crate root and sibling modules). Structural files track
+    /// the base text and never mark the overlay as "modified" on their own.
+    structural: bool,
 }
 
 struct LoadedWorkspaceInput {
@@ -2441,30 +2493,37 @@ impl SharedWorld {
             String,
             crate::line_index::LineEndings,
         )>,
+        allow_attach: bool,
     ) -> anyhow::Result<SharedOverlaySync> {
-        let open_files = files
-            .into_iter()
-            .filter_map(|(path, display_path, text, line_endings)| {
-                let key = path_key(&path);
+        let mut open_files = BTreeMap::new();
+        let mut structural_files = BTreeMap::new();
+        for (path, display_path, text, line_endings) in files {
+            let key = path_key(&path);
+            let Some(base_file) =
                 self.base_file_for_vfs_path_in(workspaces, &normalize_vfs_path(&path))
-                    .and_then(|base_file| {
-                        let db = self.host.raw_database();
-                        let base_text = db.file_text(base_file).text(db);
-                        if base_text.as_ref() == text.as_str() {
-                            return None;
-                        }
-                        Some(
-                        (
-                            key,
-                            (path, display_path, base_file, text, line_endings),
-                        )
-                        )
-                    })
-            })
-            .collect::<BTreeMap<_, _>>();
+            else {
+                continue;
+            };
+            let db = self.host.raw_database();
+            let base_text = db.file_text(base_file).text(db);
+            if base_text.as_ref() == text.as_str() {
+                // Cone member with unmodified text: kept as a structural copy
+                // (below) only when its source root actually has a modified
+                // file, so the overlay crate's module tree stays complete.
+                structural_files.insert(key, (path, display_path, base_file, text, line_endings));
+            } else {
+                open_files.insert(key, (path, display_path, base_file, text, line_endings));
+            }
+        }
 
         let old_overlay = self.session_overlays.remove(&session_id).unwrap_or_default();
-        let same_open_files = old_overlay.open_files.len() == open_files.len()
+        // An explicit attach must reach the rebuild path even when no text
+        // changed — the fast paths would otherwise return before the cone is
+        // ever built.
+        let force_attach =
+            allow_attach && old_overlay.crates.is_empty() && !open_files.is_empty();
+        let same_open_files = !force_attach
+            && old_overlay.open_files.len() == open_files.len()
             && open_files
                 .iter()
                 .all(|(key, (_, _, _, text, _))| {
@@ -2474,14 +2533,17 @@ impl SharedWorld {
                         .is_some_and(|old| old.text == *text)
             });
         if same_open_files {
+            let cone_pending = !old_overlay.open_files.is_empty() && old_overlay.crates.is_empty();
             self.session_overlays.insert(session_id, old_overlay);
             return Ok(SharedOverlaySync {
                 changed: false,
                 removed_files: Vec::new(),
+                cone_pending,
             });
         }
 
-        let same_file_set = old_overlay.open_files.len() == open_files.len()
+        let same_file_set = !force_attach
+            && old_overlay.open_files.len() == open_files.len()
             && open_files
                 .keys()
                 .all(|key| old_overlay.open_files.contains_key(key));
@@ -2505,36 +2567,58 @@ impl SharedWorld {
                 file.line_endings = line_endings;
                 change.change_file(open.overlay_file, Some(text));
             }
+            let cone_pending = !overlay.open_files.is_empty() && overlay.crates.is_empty();
             self.session_overlays.insert(session_id, overlay);
             self.host.apply_change(change);
             return Ok(SharedOverlaySync {
                 changed: true,
                 removed_files: Vec::new(),
+                cone_pending,
             });
         }
 
-        let kept_keys = open_files.keys().cloned().collect::<BTreeSet<_>>();
-        let removed_file_ids = old_overlay
-            .open_files
-            .iter()
-            .filter_map(|(key, file)| (!kept_keys.contains(key)).then_some(file.overlay_file))
-            .collect::<Vec<_>>();
+        let mut modified_roots = BTreeSet::new();
+        let mut modified_bases = Vec::new();
+        for (_, (_, _, base_file, _, _)) in &open_files {
+            modified_roots.insert(self.source_root_for_file(*base_file)?);
+            modified_bases.push(*base_file);
+        }
+
+        let attach = allow_attach || !old_overlay.crates.is_empty();
+        if attach && structural_files.is_empty() {
+            for (key, file) in &old_overlay.files_by_path {
+                if file.structural && !open_files.contains_key(key) {
+                    structural_files.insert(
+                        key.clone(),
+                        (
+                            file.path.clone(),
+                            file.display_path.clone(),
+                            match self.base_file_for_vfs_path_in(
+                                workspaces,
+                                &normalize_vfs_path(&file.path),
+                            ) {
+                                Some(base) => base,
+                                None => continue,
+                            },
+                            file.text.clone(),
+                            file.line_endings,
+                        ),
+                    );
+                }
+            }
+        }
+        let mut kept_keys = open_files.keys().cloned().collect::<BTreeSet<_>>();
         let mut overlay = ActiveSessionOverlay {
             workspaces: workspaces.to_vec(),
             ..ActiveSessionOverlay::default()
         };
 
         for (key, (path, display_path, base_file, text, line_endings)) in open_files {
-            let overlay_file = old_overlay
-                .open_files
-                .get(&key)
+            let previous = old_overlay.files_by_path.get(&key);
+            let overlay_file = previous
                 .map(|file| file.overlay_file)
-            .unwrap_or_else(|| self.allocate_overlay_file_id());
-            if old_overlay
-                .open_files
-                .get(&key)
-                .is_some_and(|old| old.text != text)
-            {
+                .unwrap_or_else(|| self.allocate_overlay_file_id());
+            if previous.is_some_and(|old| old.text != text) {
                 self.applied_overlay_files.remove(&overlay_file);
             }
             overlay.open_files.insert(
@@ -2554,17 +2638,69 @@ impl SharedWorld {
                     display_path,
                     text,
                     line_endings,
+                    structural: false,
                 },
             );
-            self.populate_overlay_crates(&mut overlay, base_file)?;
         }
 
+        // Structural copies: unmodified cone members of source roots that DO
+        // carry a modification. Without them the overlay crate's module tree
+        // is incomplete — the crate root never enters the overlay for a plain
+        // module edit and the session gets no semantics at all.
+        //
+        // Attaching the cone changes the crate graph, which invalidates
+        // world-wide queries; interactive syncs (allow_attach = false) defer
+        // it to the session's idle turn unless a cone is already attached.
+        if !modified_roots.is_empty() && attach {
+            for (key, (path, display_path, base_file, text, line_endings)) in structural_files {
+                let base_source_root = self.source_root_for_file(base_file)?;
+                if !modified_roots.contains(&base_source_root) {
+                    continue;
+                }
+                let previous = old_overlay.files_by_path.get(&key);
+                let overlay_file = previous
+                    .map(|file| file.overlay_file)
+                    .unwrap_or_else(|| self.allocate_overlay_file_id());
+                if previous.is_some_and(|old| old.text != text) {
+                    self.applied_overlay_files.remove(&overlay_file);
+                }
+                kept_keys.insert(key.clone());
+                overlay.path_by_file.insert(overlay_file, key.clone());
+                overlay.files_by_path.insert(
+                    key,
+                    ActiveOverlayFile {
+                        overlay_file,
+                        base_source_root,
+                        path,
+                        display_path,
+                        text,
+                        line_endings,
+                        structural: true,
+                    },
+                );
+            }
+        }
+
+        if attach {
+            for base_file in modified_bases {
+                self.populate_overlay_crates(&mut overlay, base_file)?;
+            }
+        }
+
+        let removed_file_ids = old_overlay
+            .files_by_path
+            .iter()
+            .filter_map(|(key, file)| (!kept_keys.contains(key)).then_some(file.overlay_file))
+            .collect::<Vec<_>>();
+
+        let cone_pending = !attach && !overlay.open_files.is_empty();
         self.session_overlays.insert(session_id, overlay);
         self.rebuild_overlay_inputs(removed_file_ids.clone())?;
 
         Ok(SharedOverlaySync {
             changed: true,
             removed_files: removed_file_ids,
+            cone_pending,
         })
     }
 
@@ -2695,6 +2831,8 @@ impl SharedWorld {
                 workspaces: old_overlay.workspaces.clone(),
                 ..ActiveSessionOverlay::default()
             };
+            let mut structural = Vec::new();
+            let mut modified_bases = Vec::new();
 
             for (key, file) in &old_overlay.files_by_path {
                 let base_file = self.base_file_for_vfs_path_in(
@@ -2707,9 +2845,13 @@ impl SharedWorld {
                 };
                 let base_text = {
                     let db = self.host.raw_database();
-                    db.file_text(base_file).text(db)
+                    db.file_text(base_file).text(db).to_string()
                 };
-                if base_text.as_ref() == file.text.as_str() {
+                if file.structural {
+                    structural.push((key.clone(), file.clone(), base_file, base_text));
+                    continue;
+                }
+                if base_text == file.text {
                     removed_files.push(file.overlay_file);
                     continue;
                 }
@@ -2733,9 +2875,41 @@ impl SharedWorld {
                         display_path: file.display_path.clone(),
                         text: file.text.clone(),
                         line_endings: file.line_endings,
+                        structural: false,
                     },
                 );
-                self.populate_overlay_crates(&mut overlay, base_file)?;
+                modified_bases.push(base_file);
+            }
+
+            if overlay.files_by_path.is_empty() {
+                // no real modification survived: the cone is pointless
+                for (_, file, _, _) in structural {
+                    removed_files.push(file.overlay_file);
+                }
+            } else {
+                let modified_roots = overlay
+                    .files_by_path
+                    .values()
+                    .map(|file| file.base_source_root)
+                    .collect::<BTreeSet<_>>();
+                for (key, mut file, base_file, base_text) in structural {
+                    let base_source_root = self.source_root_for_file(base_file)?;
+                    if !modified_roots.contains(&base_source_root) {
+                        removed_files.push(file.overlay_file);
+                        continue;
+                    }
+                    if file.text != base_text {
+                        // the base changed on disk: refresh the structural copy
+                        self.applied_overlay_files.remove(&file.overlay_file);
+                        file.text = base_text;
+                    }
+                    file.base_source_root = base_source_root;
+                    overlay.path_by_file.insert(file.overlay_file, key.clone());
+                    overlay.files_by_path.insert(key, file);
+                }
+                for base_file in modified_bases {
+                    self.populate_overlay_crates(&mut overlay, base_file)?;
+                }
             }
 
             self.session_overlays.insert(session_id, overlay);
