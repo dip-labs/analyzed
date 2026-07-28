@@ -1854,6 +1854,10 @@ struct ActiveOverlayFile {
     display_path: VfsPath,
     text: String,
     line_endings: crate::line_index::LineEndings,
+    /// Identical-to-base cone member kept so the overlay crate's module tree
+    /// stays complete (crate root and sibling modules). Structural files track
+    /// the base text and never mark the overlay as "modified" on their own.
+    structural: bool,
 }
 
 struct LoadedWorkspaceInput {
@@ -2442,26 +2446,26 @@ impl SharedWorld {
             crate::line_index::LineEndings,
         )>,
     ) -> anyhow::Result<SharedOverlaySync> {
-        let open_files = files
-            .into_iter()
-            .filter_map(|(path, display_path, text, line_endings)| {
-                let key = path_key(&path);
+        let mut open_files = BTreeMap::new();
+        let mut structural_files = BTreeMap::new();
+        for (path, display_path, text, line_endings) in files {
+            let key = path_key(&path);
+            let Some(base_file) =
                 self.base_file_for_vfs_path_in(workspaces, &normalize_vfs_path(&path))
-                    .and_then(|base_file| {
-                        let db = self.host.raw_database();
-                        let base_text = db.file_text(base_file).text(db);
-                        if base_text.as_ref() == text.as_str() {
-                            return None;
-                        }
-                        Some(
-                        (
-                            key,
-                            (path, display_path, base_file, text, line_endings),
-                        )
-                        )
-                    })
-            })
-            .collect::<BTreeMap<_, _>>();
+            else {
+                continue;
+            };
+            let db = self.host.raw_database();
+            let base_text = db.file_text(base_file).text(db);
+            if base_text.as_ref() == text.as_str() {
+                // Cone member with unmodified text: kept as a structural copy
+                // (below) only when its source root actually has a modified
+                // file, so the overlay crate's module tree stays complete.
+                structural_files.insert(key, (path, display_path, base_file, text, line_endings));
+            } else {
+                open_files.insert(key, (path, display_path, base_file, text, line_endings));
+            }
+        }
 
         let old_overlay = self.session_overlays.remove(&session_id).unwrap_or_default();
         let same_open_files = old_overlay.open_files.len() == open_files.len()
@@ -2513,28 +2517,25 @@ impl SharedWorld {
             });
         }
 
-        let kept_keys = open_files.keys().cloned().collect::<BTreeSet<_>>();
-        let removed_file_ids = old_overlay
-            .open_files
-            .iter()
-            .filter_map(|(key, file)| (!kept_keys.contains(key)).then_some(file.overlay_file))
-            .collect::<Vec<_>>();
+        let mut modified_roots = BTreeSet::new();
+        let mut modified_bases = Vec::new();
+        for (_, (_, _, base_file, _, _)) in &open_files {
+            modified_roots.insert(self.source_root_for_file(*base_file)?);
+            modified_bases.push(*base_file);
+        }
+
+        let mut kept_keys = open_files.keys().cloned().collect::<BTreeSet<_>>();
         let mut overlay = ActiveSessionOverlay {
             workspaces: workspaces.to_vec(),
             ..ActiveSessionOverlay::default()
         };
 
         for (key, (path, display_path, base_file, text, line_endings)) in open_files {
-            let overlay_file = old_overlay
-                .open_files
-                .get(&key)
+            let previous = old_overlay.files_by_path.get(&key);
+            let overlay_file = previous
                 .map(|file| file.overlay_file)
-            .unwrap_or_else(|| self.allocate_overlay_file_id());
-            if old_overlay
-                .open_files
-                .get(&key)
-                .is_some_and(|old| old.text != text)
-            {
+                .unwrap_or_else(|| self.allocate_overlay_file_id());
+            if previous.is_some_and(|old| old.text != text) {
                 self.applied_overlay_files.remove(&overlay_file);
             }
             overlay.open_files.insert(
@@ -2554,10 +2555,54 @@ impl SharedWorld {
                     display_path,
                     text,
                     line_endings,
+                    structural: false,
                 },
             );
+        }
+
+        // Structural copies: unmodified cone members of source roots that DO
+        // carry a modification. Without them the overlay crate's module tree
+        // is incomplete — the crate root never enters the overlay for a plain
+        // module edit and the session gets no semantics at all.
+        if !modified_roots.is_empty() {
+            for (key, (path, display_path, base_file, text, line_endings)) in structural_files {
+                let base_source_root = self.source_root_for_file(base_file)?;
+                if !modified_roots.contains(&base_source_root) {
+                    continue;
+                }
+                let previous = old_overlay.files_by_path.get(&key);
+                let overlay_file = previous
+                    .map(|file| file.overlay_file)
+                    .unwrap_or_else(|| self.allocate_overlay_file_id());
+                if previous.is_some_and(|old| old.text != text) {
+                    self.applied_overlay_files.remove(&overlay_file);
+                }
+                kept_keys.insert(key.clone());
+                overlay.path_by_file.insert(overlay_file, key.clone());
+                overlay.files_by_path.insert(
+                    key,
+                    ActiveOverlayFile {
+                        overlay_file,
+                        base_source_root,
+                        path,
+                        display_path,
+                        text,
+                        line_endings,
+                        structural: true,
+                    },
+                );
+            }
+        }
+
+        for base_file in modified_bases {
             self.populate_overlay_crates(&mut overlay, base_file)?;
         }
+
+        let removed_file_ids = old_overlay
+            .files_by_path
+            .iter()
+            .filter_map(|(key, file)| (!kept_keys.contains(key)).then_some(file.overlay_file))
+            .collect::<Vec<_>>();
 
         self.session_overlays.insert(session_id, overlay);
         self.rebuild_overlay_inputs(removed_file_ids.clone())?;
@@ -2695,6 +2740,8 @@ impl SharedWorld {
                 workspaces: old_overlay.workspaces.clone(),
                 ..ActiveSessionOverlay::default()
             };
+            let mut structural = Vec::new();
+            let mut modified_bases = Vec::new();
 
             for (key, file) in &old_overlay.files_by_path {
                 let base_file = self.base_file_for_vfs_path_in(
@@ -2707,9 +2754,13 @@ impl SharedWorld {
                 };
                 let base_text = {
                     let db = self.host.raw_database();
-                    db.file_text(base_file).text(db)
+                    db.file_text(base_file).text(db).to_string()
                 };
-                if base_text.as_ref() == file.text.as_str() {
+                if file.structural {
+                    structural.push((key.clone(), file.clone(), base_file, base_text));
+                    continue;
+                }
+                if base_text == file.text {
                     removed_files.push(file.overlay_file);
                     continue;
                 }
@@ -2733,9 +2784,41 @@ impl SharedWorld {
                         display_path: file.display_path.clone(),
                         text: file.text.clone(),
                         line_endings: file.line_endings,
+                        structural: false,
                     },
                 );
-                self.populate_overlay_crates(&mut overlay, base_file)?;
+                modified_bases.push(base_file);
+            }
+
+            if overlay.files_by_path.is_empty() {
+                // no real modification survived: the cone is pointless
+                for (_, file, _, _) in structural {
+                    removed_files.push(file.overlay_file);
+                }
+            } else {
+                let modified_roots = overlay
+                    .files_by_path
+                    .values()
+                    .map(|file| file.base_source_root)
+                    .collect::<BTreeSet<_>>();
+                for (key, mut file, base_file, base_text) in structural {
+                    let base_source_root = self.source_root_for_file(base_file)?;
+                    if !modified_roots.contains(&base_source_root) {
+                        removed_files.push(file.overlay_file);
+                        continue;
+                    }
+                    if file.text != base_text {
+                        // the base changed on disk: refresh the structural copy
+                        self.applied_overlay_files.remove(&file.overlay_file);
+                        file.text = base_text;
+                    }
+                    file.base_source_root = base_source_root;
+                    overlay.path_by_file.insert(file.overlay_file, key.clone());
+                    overlay.files_by_path.insert(key, file);
+                }
+                for base_file in modified_bases {
+                    self.populate_overlay_crates(&mut overlay, base_file)?;
+                }
             }
 
             self.session_overlays.insert(session_id, overlay);
