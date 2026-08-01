@@ -206,6 +206,7 @@ struct SharedAnalyzerGcCoordinator {
 
 #[derive(Default)]
 struct SharedAnalyzerGcState {
+    registered_sessions: usize,
     busy_sessions: usize,
     dirty: bool,
     collecting: bool,
@@ -537,8 +538,13 @@ impl SharedAnalyzerRegistry {
         entries
             .into_iter()
             .map(|(key, client_sessions, world, view)| {
+                // Status must never queue behind a busy world: a blocking
+                // lock here makes `analyzed status` time out exactly when
+                // operators (and watchdogs) need it most. A busy world
+                // degrades to zeroed overlay counters; client_sessions is
+                // registry-known and stays accurate.
                 let (overlay_sessions, overlay_files, workspace_loads) = world
-                    .lock()
+                    .try_lock()
                     .map(|world| {
                         (
                             world.active_overlay_sessions(),
@@ -656,10 +662,9 @@ impl SharedAnalyzerGcCoordinator {
     }
 
     fn register_session(&self) {
-        self.state
-            .lock()
-            .expect("shared analyzer gc mutex poisoned")
-            .busy_sessions += 1;
+        let mut state = self.state.lock().expect("shared analyzer gc mutex poisoned");
+        state.registered_sessions += 1;
+        state.busy_sessions += 1;
     }
 
     fn set_session_busy(&self, busy: bool) {
@@ -680,6 +685,7 @@ impl SharedAnalyzerGcCoordinator {
     fn unregister_session(&self, busy: bool) {
         let collect = {
             let mut state = self.state.lock().expect("shared analyzer gc mutex poisoned");
+            state.registered_sessions = state.registered_sessions.saturating_sub(1);
             if busy {
                 state.busy_sessions -= 1;
             }
@@ -708,8 +714,18 @@ impl SharedAnalyzerGcCoordinator {
         }
     }
 
+    /// The interner GC takes the global write permit and purges interned
+    /// types; every session then re-infers the world from scratch — a
+    /// 1-2 minute stop-the-world at fleet heap sizes. Paced agent sessions
+    /// (op, short sleep, op) produce all-idle micro-windows constantly, so
+    /// gating on "nobody busy right now" alone turns the GC into a periodic
+    /// stall generator. Collect only when NO session is registered at all;
+    /// ANALYZED_GC_UNDER_LOAD=1 restores the old eager behavior.
     fn start_if_ready(&self, state: &mut SharedAnalyzerGcState) -> bool {
-        if state.dirty && !state.collecting && state.busy_sessions == 0 {
+        static GC_UNDER_LOAD: LazyLock<bool> =
+            LazyLock::new(|| env::var_os("ANALYZED_GC_UNDER_LOAD").is_some());
+        let quiescent = state.registered_sessions == 0 || *GC_UNDER_LOAD;
+        if quiescent && state.dirty && !state.collecting && state.busy_sessions == 0 {
             state.dirty = false;
             state.collecting = true;
             true
@@ -1194,10 +1210,12 @@ impl SharedAnalyzerRuntime {
         if let Some(gc) = &gc {
             gc.register_session();
         }
-        let (id, input_generation, access) = world
-            .lock()
-            .expect("shared world mutex poisoned")
-            .register_session();
+        let (id, input_generation, access) = {
+            let mut world = world.lock().expect("shared world mutex poisoned");
+            let registered = world.register_session();
+            world.set_session_workspaces(registered.0, workspace_indexes.clone());
+            registered
+        };
         let session = Arc::new(SharedAnalyzerRuntimeSession {
             world: Arc::clone(&world),
             access,
@@ -1496,7 +1514,9 @@ impl SharedAnalyzerRuntime {
         if world
             .session_overlays
             .get(&self.session_id())
-            .is_some_and(|overlay| !overlay.files_by_path.is_empty())
+            .is_some_and(|overlay| {
+                !overlay.files_by_path.is_empty() || !overlay.direct_files.is_empty()
+            })
         {
             return Ok(true);
         }
@@ -1865,6 +1885,18 @@ struct ActiveSessionOverlay {
     files_by_path: BTreeMap<String, ActiveOverlayFile>,
     path_by_file: BTreeMap<FileId, String>,
     crates: BTreeMap<ide::Crate, FileId>,
+    /// Single-owner fast path: unsaved edits applied DIRECTLY to the base
+    /// file input because the file's workspace is visible to exactly one
+    /// session. No overlay ids, no structural cone, no crate-graph change —
+    /// invalidation stays inside the owning workspace, exactly like a
+    /// standalone rust-analyzer edit.
+    direct_files: BTreeMap<String, DirectEditFile>,
+}
+
+#[derive(Clone, Debug)]
+struct DirectEditFile {
+    base_file: FileId,
+    text: String,
 }
 
 impl ActiveSessionOverlay {
@@ -2012,6 +2044,10 @@ pub struct SharedWorld {
     base_crates: Vec<ide::Crate>,
     base_max_source_root: Option<u32>,
     session_overlays: BTreeMap<u64, ActiveSessionOverlay>,
+    /// Which workspaces each registered session's view spans; a workspace
+    /// referenced by exactly one session is "owned" and eligible for the
+    /// direct-edit fast path.
+    session_workspaces: BTreeMap<u64, Vec<usize>>,
     input_generation: Arc<AtomicU64>,
     applied_source_roots: Vec<SourceRoot>,
     applied_local_roots: rustc_hash::FxHashSet<SourceRootId>,
@@ -2031,6 +2067,7 @@ impl SharedWorld {
             base_crates: Vec::new(),
             base_max_source_root: None,
             session_overlays: BTreeMap::new(),
+            session_workspaces: BTreeMap::new(),
             input_generation: Arc::new(AtomicU64::new(0)),
             applied_source_roots: Vec::new(),
             applied_local_roots: rustc_hash::FxHashSet::default(),
@@ -2242,6 +2279,15 @@ impl SharedWorld {
         change.set_crate_graph(crate_graph);
         change.set_proc_macros(proc_macros);
         for (file_id, text) in file_texts {
+            // An open document with a direct edit owns this input; disk
+            // updates must not clobber it (upstream open-doc semantics).
+            if self
+                .session_overlays
+                .values()
+                .any(|overlay| overlay.direct_files.values().any(|d| d.base_file == file_id))
+            {
+                continue;
+            }
             change.change_file(file_id, Some(text));
         }
 
@@ -2300,6 +2346,28 @@ impl SharedWorld {
         }
     }
 
+    fn set_session_workspaces(&mut self, session_id: u64, workspaces: Vec<usize>) {
+        self.session_workspaces.insert(session_id, workspaces);
+    }
+
+    fn workspace_exclusive_to(&self, index: usize, session_id: u64) -> bool {
+        self.session_workspaces
+            .iter()
+            .all(|(id, workspaces)| *id == session_id || !workspaces.contains(&index))
+    }
+
+    /// Current on-disk text of a workspace file, normalized like every other
+    /// text input (used to restore a direct-edited file).
+    fn disk_text_for(&self, workspaces: &[usize], path: &VfsPath) -> Option<String> {
+        let fs_path = normalize_vfs_path(path);
+        let fs_path = fs_path.as_path()?;
+        let fs_path: &Path = fs_path.as_ref();
+        let raw = std::fs::read_to_string(fs_path).ok()?;
+        let (text, _) = crate::line_index::LineEndings::normalize(raw);
+        let _ = workspaces;
+        Some(text)
+    }
+
     fn register_session(&mut self) -> (u64, Arc<AtomicU64>, Arc<SharedWorldAccess>) {
         let id = self.next_session_id;
         self.next_session_id += 1;
@@ -2309,14 +2377,31 @@ impl SharedWorld {
     }
 
     fn unregister_session(&mut self, session_id: u64) -> bool {
-        let old_files = self
-            .session_overlays
-            .remove(&session_id)
+        self.session_workspaces.remove(&session_id);
+        let overlay = self.session_overlays.remove(&session_id);
+        let mut direct_restored = false;
+        if let Some(overlay) = &overlay {
+            let mut change = ChangeWithProcMacros::default();
+            for (key, direct) in &overlay.direct_files {
+                let path = VfsPath::from(AbsPathBuf::assert_utf8(PathBuf::from(key.clone())));
+                let disk = self
+                    .disk_text_for(&overlay.workspaces, &path)
+                    .unwrap_or_default();
+                if disk != direct.text {
+                    change.change_file(direct.base_file, Some(disk));
+                    direct_restored = true;
+                }
+            }
+            if direct_restored {
+                self.host.apply_change(change);
+            }
+        }
+        let old_files = overlay
             .into_iter()
             .flat_map(|overlay| overlay.file_ids().collect::<Vec<_>>())
             .collect::<Vec<_>>();
         if old_files.is_empty() {
-            return false;
+            return direct_restored;
         }
         if let Err(error) = self.rebuild_overlay_inputs(old_files) {
             tracing::error!("failed to unregister shared analyzer session {session_id}: {error}");
@@ -2497,15 +2582,43 @@ impl SharedWorld {
     ) -> anyhow::Result<SharedOverlaySync> {
         let mut open_files = BTreeMap::new();
         let mut structural_files = BTreeMap::new();
+        let mut direct_updates: BTreeMap<String, (FileId, String)> = BTreeMap::new();
+        let old_direct = self
+            .session_overlays
+            .get(&session_id)
+            .map(|overlay| overlay.direct_files.clone())
+            .unwrap_or_default();
         for (path, display_path, text, line_endings) in files {
             let key = path_key(&path);
-            let Some(base_file) =
-                self.base_file_for_vfs_path_in(workspaces, &normalize_vfs_path(&path))
-            else {
+            if let Some(direct) = old_direct.get(&key) {
+                direct_updates.insert(key, (direct.base_file, text));
+                continue;
+            }
+            let normalized = normalize_vfs_path(&path);
+            let mut resolved = None;
+            for &index in workspaces {
+                let Some(workspace) = self.loaded_workspaces.get(index) else {
+                    continue;
+                };
+                if let Some((base_file, _)) = workspace._vfs.file_id(&normalized)
+                    && workspace._vfs.exists(base_file)
+                {
+                    resolved = Some((index, base_file));
+                    break;
+                }
+            }
+            let Some((workspace_index, base_file)) = resolved else {
                 continue;
             };
             let db = self.host.raw_database();
             let base_text = db.file_text(base_file).text(db);
+            if base_text.as_ref() != text.as_str()
+                && self.workspace_exclusive_to(workspace_index, session_id)
+            {
+                // Single-owner workspace: edit the base input directly.
+                direct_updates.insert(key, (base_file, text));
+                continue;
+            }
             if base_text.as_ref() == text.as_str() {
                 // Cone member with unmodified text: kept as a structural copy
                 // (below) only when its source root actually has a modified
@@ -2516,7 +2629,38 @@ impl SharedWorld {
             }
         }
 
-        let old_overlay = self.session_overlays.remove(&session_id).unwrap_or_default();
+        // ---- single-owner direct edits: applied here, no overlay machinery,
+        // ---- no source roots, no crate-graph change, no cones.
+        let mut direct_changed = false;
+        {
+            let mut change = ChangeWithProcMacros::default();
+            for (key, direct) in &old_direct {
+                if !direct_updates.contains_key(key) {
+                    let path = VfsPath::from(AbsPathBuf::assert_utf8(PathBuf::from(key.clone())));
+                    let disk = self.disk_text_for(workspaces, &path).unwrap_or_default();
+                    if direct.text != disk {
+                        change.change_file(direct.base_file, Some(disk));
+                        direct_changed = true;
+                    }
+                }
+            }
+            for (key, (base_file, text)) in &direct_updates {
+                if !old_direct.get(key).is_some_and(|direct| direct.text == *text) {
+                    change.change_file(*base_file, Some(text.clone()));
+                    direct_changed = true;
+                }
+            }
+            if direct_changed {
+                self.host.apply_change(change);
+            }
+        }
+        let new_direct = direct_updates
+            .into_iter()
+            .map(|(key, (base_file, text))| (key, DirectEditFile { base_file, text }))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut old_overlay = self.session_overlays.remove(&session_id).unwrap_or_default();
+        old_overlay.direct_files = new_direct;
         // An explicit attach must reach the rebuild path even when no text
         // changed — the fast paths would otherwise return before the cone is
         // ever built.
@@ -2536,7 +2680,7 @@ impl SharedWorld {
             let cone_pending = !old_overlay.open_files.is_empty() && old_overlay.crates.is_empty();
             self.session_overlays.insert(session_id, old_overlay);
             return Ok(SharedOverlaySync {
-                changed: false,
+                changed: direct_changed,
                 removed_files: Vec::new(),
                 cone_pending,
             });
@@ -2610,6 +2754,7 @@ impl SharedWorld {
         let mut kept_keys = open_files.keys().cloned().collect::<BTreeSet<_>>();
         let mut overlay = ActiveSessionOverlay {
             workspaces: workspaces.to_vec(),
+            direct_files: old_overlay.direct_files.clone(),
             ..ActiveSessionOverlay::default()
         };
 

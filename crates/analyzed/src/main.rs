@@ -113,23 +113,57 @@ fn run_upstream_cli(args: Vec<OsString>) -> anyhow::Result<ExitCode> {
 }
 
 fn run_stdio() -> anyhow::Result<()> {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
     let paths = RuntimePaths::discover()?;
     let mut daemon_reader = analyzed_daemon::connect_lsp_session(paths)?;
     let mut daemon_writer = daemon_reader.try_clone()?;
+    // Losing the daemon mid-session must be a CLIENT-VISIBLE failure: a
+    // silent exit 0 leaves supervisors believing the server finished cleanly
+    // while every in-flight request just vanished. A clean LSP shutdown is
+    // recognized by the client's `exit` notification (or the client closing
+    // stdin); anything else is an abnormal daemon loss and exits non-zero.
+    let exit_seen = Arc::new(AtomicBool::new(false));
+    let exit_seen_writer = Arc::clone(&exit_seen);
     thread::spawn(move || {
         let stdin = io::stdin();
         let mut stdin = stdin.lock();
-        _ = io::copy(&mut stdin, &mut daemon_writer);
-        process::exit(0);
+        let mut buffer = [0u8; 8192];
+        loop {
+            let count = match stdin.read(&mut buffer) {
+                Ok(0) | Err(_) => process::exit(0), // client closed us: clean
+                Ok(count) => count,
+            };
+            if !exit_seen_writer.load(Ordering::Relaxed)
+                && buffer[..count]
+                    .windows(b"\"method\":\"exit\"".len())
+                    .any(|window| window == b"\"method\":\"exit\"")
+            {
+                exit_seen_writer.store(true, Ordering::Relaxed);
+            }
+            if daemon_writer.write_all(&buffer[..count]).is_err() {
+                // daemon side gone: let the reader classify and set the code
+                return;
+            }
+        }
     });
 
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     let mut buffer = [0; 8192];
     loop {
-        let count = daemon_reader.read(&mut buffer)?;
+        let count = daemon_reader.read(&mut buffer).unwrap_or(0);
         if count == 0 {
-            break;
+            if exit_seen.load(Ordering::Relaxed) {
+                break;
+            }
+            eprintln!(
+                "analyzed: lost connection to the shared daemon (stopped or crashed) with the session still active"
+            );
+            process::exit(1);
         }
 
         stdout.write_all(&buffer[..count])?;
