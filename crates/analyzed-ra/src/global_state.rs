@@ -65,8 +65,7 @@ impl GlobalStateSnapshot {
                 // Recompute from the current text instead of panicking: a
                 // panicked worker poisons the shared task-pool channel and
                 // cascades SendError panics into unrelated in-flight
-                // requests on other sessions (see
-                // inc-2026-08-04-prod-code-rust-warm-query-latency).
+                // requests on other sessions.
                 tracing::warn!(
                     "line endings missing from shared cache for file {id:?}; recomputing from text"
                 );
