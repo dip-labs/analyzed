@@ -1627,13 +1627,20 @@ struct SharedLineEndings {
 
 impl SharedLineEndings {
     fn get(&self, file_id: FileId) -> Option<crate::line_index::LineEndings> {
+        // Overlay/direct-edit entries reflect the session's OPEN (possibly
+        // unsaved) text and must win over the base workspace's on-disk
+        // snapshot for the same file id.
+        if let Some(line_endings) = self.overlay.get(&file_id) {
+            return Some(*line_endings);
+        }
+
         for line_endings in &self.workspaces {
             if let Some(line_endings) = line_endings.get(&file_id) {
                 return Some(*line_endings);
             }
         }
 
-        self.overlay.get(&file_id).copied()
+        None
     }
 }
 
@@ -1897,6 +1904,11 @@ struct ActiveSessionOverlay {
 struct DirectEditFile {
     base_file: FileId,
     text: String,
+    // Computed once when the edit is applied, not on every session-cache
+    // refresh (that runs on every keystroke via sync_open_files -- redoing
+    // an O(text) scan there would reintroduce the exact hot-path cost the
+    // mass-load fix eliminated for the crate-graph rebuild).
+    endings: crate::line_index::LineEndings,
 }
 
 impl ActiveSessionOverlay {
@@ -2477,6 +2489,19 @@ impl SharedWorld {
             overlay_line_endings.extend(session_overlay.files_by_path.values().map(|file| {
                 (file.overlay_file, file.line_endings)
             }));
+            // Direct-edited files reuse the base FileId (no overlay id is
+            // minted for them) and the base workspace map normally still
+            // has a valid entry for that id from initial load — but if the
+            // edit changed CRLF/LF, the stale base entry would silently
+            // mismap positions. `endings` was already computed once when
+            // the edit was applied (sync_session_overlay) — O(1) here, no
+            // per-refresh text scan on the keystroke path.
+            overlay_line_endings.extend(
+                session_overlay
+                    .direct_files
+                    .values()
+                    .map(|direct| (direct.base_file, direct.endings)),
+            );
         }
 
         SharedLineEndings {
@@ -2582,7 +2607,13 @@ impl SharedWorld {
     ) -> anyhow::Result<SharedOverlaySync> {
         let mut open_files = BTreeMap::new();
         let mut structural_files = BTreeMap::new();
-        let mut direct_updates: BTreeMap<String, (FileId, String)> = BTreeMap::new();
+        // The caller (session.rs) already normalized this text and computed
+        // its LineEndings once; carry that value through instead of
+        // re-scanning the text here or on every session-cache refresh.
+        let mut direct_updates: BTreeMap<
+            String,
+            (FileId, String, crate::line_index::LineEndings),
+        > = BTreeMap::new();
         let old_direct = self
             .session_overlays
             .get(&session_id)
@@ -2591,7 +2622,7 @@ impl SharedWorld {
         for (path, display_path, text, line_endings) in files {
             let key = path_key(&path);
             if let Some(direct) = old_direct.get(&key) {
-                direct_updates.insert(key, (direct.base_file, text));
+                direct_updates.insert(key, (direct.base_file, text, line_endings));
                 continue;
             }
             let normalized = normalize_vfs_path(&path);
@@ -2616,7 +2647,7 @@ impl SharedWorld {
                 && self.workspace_exclusive_to(workspace_index, session_id)
             {
                 // Single-owner workspace: edit the base input directly.
-                direct_updates.insert(key, (base_file, text));
+                direct_updates.insert(key, (base_file, text, line_endings));
                 continue;
             }
             if base_text.as_ref() == text.as_str() {
@@ -2644,7 +2675,7 @@ impl SharedWorld {
                     }
                 }
             }
-            for (key, (base_file, text)) in &direct_updates {
+            for (key, (base_file, text, _)) in &direct_updates {
                 if !old_direct.get(key).is_some_and(|direct| direct.text == *text) {
                     change.change_file(*base_file, Some(text.clone()));
                     direct_changed = true;
@@ -2656,7 +2687,9 @@ impl SharedWorld {
         }
         let new_direct = direct_updates
             .into_iter()
-            .map(|(key, (base_file, text))| (key, DirectEditFile { base_file, text }))
+            .map(|(key, (base_file, text, endings))| {
+                (key, DirectEditFile { base_file, text, endings })
+            })
             .collect::<BTreeMap<_, _>>();
 
         let mut old_overlay = self.session_overlays.remove(&session_id).unwrap_or_default();

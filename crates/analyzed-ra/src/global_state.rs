@@ -56,7 +56,25 @@ impl GlobalStateSnapshot {
     }
 
     pub(crate) fn file_line_index(&self, id: FileId) -> Cancellable<LineIndex> {
-        let endings = self.shared.line_endings(id).expect("shared line endings");
+        let endings = match self.shared.line_endings(id) {
+            Some(endings) => endings,
+            None => {
+                // The line-endings side map can miss a file id (e.g. a file
+                // whose overlay routing changed, or a lazily-loaded
+                // dependency file never captured at workspace-commit time).
+                // Recompute from the current text instead of panicking: a
+                // panicked worker poisons the shared task-pool channel and
+                // cascades SendError panics into unrelated in-flight
+                // requests on other sessions (see
+                // inc-2026-08-04-prod-code-rust-warm-query-latency).
+                tracing::warn!(
+                    "line endings missing from shared cache for file {id:?}; recomputing from text"
+                );
+                let text = self.analysis.file_text(id)?;
+                let (_, endings) = crate::line_index::LineEndings::normalize(text.to_string());
+                endings
+            }
+        };
         let index = self.analysis.file_line_index(id)?;
         let encoding = self.config.caps().negotiated_encoding();
         Ok(LineIndex { index, endings, encoding })
