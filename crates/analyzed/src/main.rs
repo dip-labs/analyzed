@@ -183,6 +183,16 @@ fn print_status() -> anyhow::Result<()> {
 }
 
 fn run_daemon(foreground: bool, startup_lock_owned: bool) -> anyhow::Result<()> {
+    // The daemon never installed a tracing subscriber, so every
+    // tracing::{warn,error,info}! call in analyzed-ra (including the one
+    // added for the line-endings cache-miss recovery) was a silent no-op --
+    // only panic messages ever reached daemon.log. Reuse upstream's own
+    // logging setup (RA_LOG-driven filter, defaults to "warn", writes to
+    // stderr which launchd already captures into daemon.log).
+    if let Err(e) = driver::setup_logging(None) {
+        eprintln!("Failed to setup logging: {e:#}");
+    }
+
     let paths = RuntimePaths::discover()?;
 
     if foreground {
