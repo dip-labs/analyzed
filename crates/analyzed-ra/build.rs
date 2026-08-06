@@ -565,6 +565,25 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
         },
     )?;
     build_support::add_attr::<ast::Fn>(&mut source, "_update_diagnostics", "#[allow(dead_code)]")?;
+
+    // Upstream panics via `.unwrap()` if the diagnostics-result channel's
+    // receiver is already gone. In analyzed's shared daemon a session's own
+    // receiver can be dropped (session teardown) while its background
+    // diagnostics fan-out is still finishing on other worker threads -- a
+    // harmless race upstream never observes because there the whole process
+    // exits together with the receiver. See
+    // https://github.com/dip-labs/analyzed (fix: don't crash a worker on a
+    // line-endings cache miss) for the sibling issue this class of panic was
+    // first noticed alongside.
+    let dropped_sends =
+        build_support::drop_send_result(&mut source, "spawn_native_diagnostics")?;
+    if dropped_sends != 2 {
+        return Err(format!(
+            "expected 2 `.send(..).unwrap()` call sites in `spawn_native_diagnostics`, found {dropped_sends} -- upstream's shape changed, update this patch"
+        )
+        .into());
+    }
+
     build_support::extract(
         &mut source,
         "_update_tests",
