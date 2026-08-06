@@ -946,6 +946,48 @@ pub fn redirect_call(
     commit(source, editor)
 }
 
+/// Rewrites every `<expr>.send(..).unwrap()` statement in `function` to
+/// `let _ = <expr>.send(..);`, returning how many call sites were rewritten.
+///
+/// A dropped receiver on the other end (e.g. a session's main loop tearing
+/// down while a background task it spawned is still finishing) is an
+/// expected race, not a bug worth a panic -- discarding the send result
+/// mirrors how the rest of the crate already discards send/recv errors on
+/// shutdown paths.
+pub fn drop_send_result(source: &mut String, function: &str) -> Result<usize, Box<dyn Error>> {
+    let (editor, root) = open(source)?;
+    let function_node: ast::Fn = named(&root, function)?;
+    let targets: Vec<(ast::MethodCallExpr, ast::MethodCallExpr)> = calls(&function_node, "unwrap")
+        .filter_map(|call| match call.receiver() {
+            Some(ast::Expr::MethodCallExpr(send_call))
+                if send_call.name_ref().is_some_and(|it| it.text() == "send") =>
+            {
+                Some((call, send_call))
+            }
+            _ => None,
+        })
+        .collect();
+    let count = targets.len();
+    for (unwrap_call, send_call) in &targets {
+        let stmt = unwrap_call
+            .syntax()
+            .ancestors()
+            .find_map(ast::ExprStmt::cast)
+            .ok_or("`.send(..).unwrap()` is not an expression statement")?;
+        let replacement = format!("let _ = {};", send_call.syntax().text());
+        let file = parse_file(&format!("fn w() {{\n    {replacement}\n}}"))?;
+        let let_stmt = one(
+            file.syntax().descendants().filter_map(ast::LetStmt::cast),
+            "generated `let _ = ..;` statement",
+        )?;
+        editor.replace(stmt.syntax(), let_stmt.syntax().clone());
+    }
+    if count > 0 {
+        commit(source, editor)?;
+    }
+    Ok(count)
+}
+
 fn visibility_node(visibility: &str) -> Result<ast::Visibility, Box<dyn Error>> {
     match visibility {
         "pub" => Ok(make::visibility_pub()),
@@ -1052,5 +1094,39 @@ mod tests {
             source,
             "#![allow(clippy::all)]\n\nuse crate::patched::run_flycheck;\nuse std::path::Path;\n"
         );
+    }
+
+    #[test]
+    fn drop_send_result_rewrites_every_send_unwrap() {
+        let mut source = String::from(
+            "fn spawn(sender: Sender<Task>) {\n    \
+             sender.send(Task::A).unwrap();\n    \
+             let x = compute().unwrap();\n    \
+             sender.send(Task::B(1, 2)).unwrap();\n\
+             }\n",
+        );
+
+        let count = drop_send_result(&mut source, "spawn").unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(
+            source,
+            "fn spawn(sender: Sender<Task>) {\n    \
+             let _ = sender.send(Task::A);\n    \
+             let x = compute().unwrap();\n    \
+             let _ = sender.send(Task::B(1, 2));\n\
+             }\n"
+        );
+    }
+
+    #[test]
+    fn drop_send_result_is_a_noop_without_send_unwrap() {
+        let mut source = String::from("fn spawn() {\n    let x = compute().unwrap();\n}\n");
+        let original = source.clone();
+
+        let count = drop_send_result(&mut source, "spawn").unwrap();
+
+        assert_eq!(count, 0);
+        assert_eq!(source, original);
     }
 }
