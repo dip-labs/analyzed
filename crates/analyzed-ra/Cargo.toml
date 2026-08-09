@@ -16,6 +16,10 @@ tag = "2026-07-27"
 name = "ra_ap_rust_analyzer"
 path = "src/lib.rs"
 doctest = false
+# The crate's `cfg(test)` build is the `lib_parity` test target, which includes
+# the same generated root module; unit tests inside `src/` run from there. A lib
+# test target would compile that tree a second time and duplicate the whole
+# suite, so there is none. See the comment on `#![cfg(not(test))]` in src/lib.rs.
 test = false
 
 [features]
