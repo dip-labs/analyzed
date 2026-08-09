@@ -947,7 +947,11 @@ pub fn redirect_call(
 }
 
 /// Rewrites every `<expr>.send(..).unwrap()` statement in `function` to
-/// `let _ = <expr>.send(..);`, returning how many call sites were rewritten.
+/// `let _ = <expr>.send(..);`, returning how many statements were rewritten.
+///
+/// Errors when a matching call is not a statement of its own -- a tail
+/// expression or a bound initializer -- because its value is observed there
+/// and discarding it would change the surrounding code's meaning.
 ///
 /// A dropped receiver on the other end (e.g. a session's main loop tearing
 /// down while a background task it spawned is still finishing) is an
@@ -967,13 +971,31 @@ pub fn drop_send_result(source: &mut String, function: &str) -> Result<usize, Bo
             _ => None,
         })
         .collect();
-    let count = targets.len();
+    let mut rewritten = 0;
     for (unwrap_call, send_call) in &targets {
+        // Resolve the innermost enclosing statement, not the innermost
+        // enclosing *expression* statement: when the call is a tail expression
+        // or the initializer of a binding, the latter walks straight past it
+        // and lands on whatever statement encloses the whole construct.
         let stmt = unwrap_call
             .syntax()
             .ancestors()
-            .find_map(ast::ExprStmt::cast)
-            .ok_or("`.send(..).unwrap()` is not an expression statement")?;
+            .find_map(ast::Stmt::cast)
+            .ok_or_else(|| {
+                format!("`.send(..).unwrap()` in `{function}` is not part of a statement")
+            })?;
+        let holds_the_call = match &stmt {
+            ast::Stmt::ExprStmt(expr_stmt) => expr_stmt
+                .expr()
+                .is_some_and(|expr| expr.syntax() == unwrap_call.syntax()),
+            _ => false,
+        };
+        if !holds_the_call {
+            return Err(format!(
+                "`.send(..).unwrap()` in `{function}` is not a statement of its own -- its value is used, so the result cannot be discarded"
+            )
+            .into());
+        }
         let replacement = format!("let _ = {};", send_call.syntax().text());
         let file = parse_file(&format!("fn w() {{\n    {replacement}\n}}"))?;
         let let_stmt = one(
@@ -981,11 +1003,12 @@ pub fn drop_send_result(source: &mut String, function: &str) -> Result<usize, Bo
             "generated `let _ = ..;` statement",
         )?;
         editor.replace(stmt.syntax(), let_stmt.syntax().clone());
+        rewritten += 1;
     }
-    if count > 0 {
+    if rewritten > 0 {
         commit(source, editor)?;
     }
-    Ok(count)
+    Ok(rewritten)
 }
 
 fn visibility_node(visibility: &str) -> Result<ast::Visibility, Box<dyn Error>> {
@@ -1117,6 +1140,64 @@ mod tests {
              let _ = sender.send(Task::B(1, 2));\n\
              }\n"
         );
+    }
+
+    #[test]
+    fn drop_send_result_rejects_a_tail_expression_send() {
+        let mut source = String::from(
+            "fn spawn(pool: Pool) {\n    \
+             pool.spawn_with_sender(move |sender| sender.send(Task::A).unwrap());\n\
+             }\n",
+        );
+        let original = source.clone();
+
+        let error = drop_send_result(&mut source, "spawn").unwrap_err();
+
+        assert!(
+            error.to_string().contains("is not a statement of its own"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(source, original);
+    }
+
+    #[test]
+    fn drop_send_result_rejects_branching_tail_expression_sends() {
+        let mut source = String::from(
+            "fn spawn(pool: Pool) {\n    \
+             pool.spawn_with_sender(move |sender| {\n        \
+             if ready {\n            \
+             sender.send(Task::A).unwrap()\n        \
+             } else {\n            \
+             sender.send(Task::B).unwrap()\n        \
+             }\n    \
+             });\n\
+             }\n",
+        );
+        let original = source.clone();
+
+        let error = drop_send_result(&mut source, "spawn").unwrap_err();
+
+        assert!(
+            error.to_string().contains("is not a statement of its own"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(source, original);
+    }
+
+    #[test]
+    fn drop_send_result_rejects_a_bound_send() {
+        let mut source = String::from(
+            "fn spawn(sender: Sender<Task>) {\n    let sent = sender.send(Task::A).unwrap();\n}\n",
+        );
+        let original = source.clone();
+
+        let error = drop_send_result(&mut source, "spawn").unwrap_err();
+
+        assert!(
+            error.to_string().contains("is not a statement of its own"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(source, original);
     }
 
     #[test]

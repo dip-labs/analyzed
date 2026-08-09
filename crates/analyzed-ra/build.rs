@@ -566,22 +566,28 @@ fn patch_main_loop_source(main_loop_rs: &Path) -> Result<(), Box<dyn Error>> {
     )?;
     build_support::add_attr::<ast::Fn>(&mut source, "_update_diagnostics", "#[allow(dead_code)]")?;
 
-    // Upstream panics via `.unwrap()` if the diagnostics-result channel's
-    // receiver is already gone. In analyzed's shared daemon a session's own
-    // receiver can be dropped (session teardown) while its background
-    // diagnostics fan-out is still finishing on other worker threads -- a
-    // harmless race upstream never observes because there the whole process
-    // exits together with the receiver. See
-    // https://github.com/dip-labs/analyzed (fix: don't crash a worker on a
-    // line-endings cache miss) for the sibling issue this class of panic was
-    // first noticed alongside.
-    let dropped_sends =
-        build_support::drop_send_result(&mut source, "spawn_native_diagnostics")?;
-    if dropped_sends != 2 {
-        return Err(format!(
-            "expected 2 `.send(..).unwrap()` call sites in `spawn_native_diagnostics`, found {dropped_sends} -- upstream's shape changed, update this patch"
-        )
-        .into());
+    // Upstream panics via `.unwrap()` when a `spawn_with_sender` task can't
+    // hand its result back, because there the receiver only ever drops as the
+    // whole process exits. analyzed's daemon outlives any single session, so a
+    // session's own receiver can drop (session teardown) while its background
+    // tasks are still running on shared worker threads -- a harmless race, the
+    // client that would have received the result is already gone. Same class of
+    // teardown noise as 9fda915.
+    //
+    // Cache priming is the longest-running of these: it scans the whole project
+    // and is the most likely to still be in flight at teardown.
+    for (function, expected) in [
+        ("spawn_native_diagnostics", 2),
+        ("prime_caches", 3),
+        ("handle_deferred_task", 2),
+    ] {
+        let dropped_sends = build_support::drop_send_result(&mut source, function)?;
+        if dropped_sends != expected {
+            return Err(format!(
+                "expected {expected} `.send(..).unwrap()` call sites in `{function}`, found {dropped_sends} -- upstream's shape changed, update this patch"
+            )
+            .into());
+        }
     }
 
     build_support::extract(
