@@ -194,6 +194,20 @@ struct SharedAnalyzerWorkspaceLoad {
     ready: Condvar,
 }
 
+/// Keeps the in-flight entry in [`SharedAnalyzerRegistryState::loads`] tied to
+/// the leader that created it. `publish` retires it on the normal completion
+/// path; `Drop` does the same when the leader unwinds instead, so a load that
+/// panics can never leave an entry behind for later sessions to park on.
+struct SharedAnalyzerWorkspaceLoadGuard<'a> {
+    registry: &'a SharedAnalyzerRegistry,
+    key: SharedAnalyzerWorkspaceLoadKey,
+    load: Arc<SharedAnalyzerWorkspaceLoad>,
+    armed: bool,
+}
+
+const ABANDONED_WORKSPACE_LOAD: &str =
+    "shared analyzer workspace load was abandoned before it published a result";
+
 struct SharedAnalyzerRegistryLease {
     registry: Weak<SharedAnalyzerRegistry>,
     key: SharedAnalyzerBackendKey,
@@ -463,19 +477,9 @@ impl SharedAnalyzerRegistry {
             world: world_key,
             project: load_key,
         };
-        let (load, leader) = {
-            let mut state = self.state()?;
-            match state.loads.entry(registry_load_key.clone()) {
-                Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
-                Entry::Vacant(entry) => {
-                    let load = Arc::new(SharedAnalyzerWorkspaceLoad::new());
-                    entry.insert(Arc::clone(&load));
-                    (load, true)
-                }
-            }
-        };
+        let (load, guard) = self.begin_workspace_load(registry_load_key)?;
 
-        if leader {
+        if let Some(guard) = guard {
             let result = SharedWorld::prepare_workspace_load(source, config)
                 .and_then(|loaded| {
                     let access = world
@@ -493,11 +497,37 @@ impl SharedAnalyzerRegistry {
                     }
                     result
                 });
-            load.finish(result);
-            self.state()?.loads.remove(&registry_load_key);
+            guard.publish(result);
         }
 
         load.wait()
+    }
+
+    /// Joins the in-flight load for `key`, becoming its leader when there is
+    /// none yet. The leader gets a guard it must `publish` through; until then
+    /// the guard owns the registry entry and retires it even on unwind.
+    fn begin_workspace_load(
+        &self,
+        key: SharedAnalyzerWorkspaceLoadKey,
+    ) -> anyhow::Result<(
+        Arc<SharedAnalyzerWorkspaceLoad>,
+        Option<SharedAnalyzerWorkspaceLoadGuard<'_>>,
+    )> {
+        let mut state = self.state()?;
+        Ok(match state.loads.entry(key.clone()) {
+            Entry::Occupied(entry) => (Arc::clone(entry.get()), None),
+            Entry::Vacant(entry) => {
+                let load = Arc::new(SharedAnalyzerWorkspaceLoad::new());
+                entry.insert(Arc::clone(&load));
+                let guard = SharedAnalyzerWorkspaceLoadGuard {
+                    registry: self,
+                    key,
+                    load: Arc::clone(&load),
+                    armed: true,
+                };
+                (load, Some(guard))
+            }
+        })
     }
 
     pub fn unregister(&self, key: &SharedAnalyzerBackendKey) {
@@ -628,6 +658,17 @@ impl SharedAnalyzerWorkspaceLoad {
         }
     }
 
+    /// Publishes a failure for a load nobody is going to finish. Poisoning is
+    /// ignored on purpose: this is the last chance to wake the waiters, and
+    /// leaving them parked is the failure mode being fixed here.
+    fn fail(&self, reason: &str) {
+        let mut slot = self.result.lock().unwrap_or_else(|error| error.into_inner());
+        if slot.is_none() {
+            *slot = Some(Err(reason.to_owned()));
+        }
+        self.ready.notify_all();
+    }
+
     fn wait(&self) -> anyhow::Result<usize> {
         let mut slot = self
             .result
@@ -646,6 +687,37 @@ impl SharedAnalyzerWorkspaceLoad {
                 .wait(slot)
                 .map_err(|error| anyhow::format_err!("shared analyzer load mutex is poisoned: {error}"))?;
         }
+    }
+}
+
+impl SharedAnalyzerWorkspaceLoadGuard<'_> {
+    /// The leader produced a result: retire the registry entry so the next
+    /// attempt starts clean, hand the result to the waiters, and disarm so
+    /// `Drop` leaves the normal completion path alone.
+    fn publish(mut self, result: anyhow::Result<usize>) {
+        self.retire();
+        self.load.finish(result);
+        self.armed = false;
+    }
+
+    fn retire(&self) {
+        if let Ok(mut state) = self.registry.state.lock() {
+            state.loads.remove(&self.key);
+        }
+    }
+}
+
+impl Drop for SharedAnalyzerWorkspaceLoadGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        // The leader unwound. Retire the entry first so a later attempt becomes
+        // a fresh leader instead of inheriting this one, then fail whoever is
+        // already waiting on it.
+        self.retire();
+        self.load.fail(ABANDONED_WORKSPACE_LOAD);
     }
 }
 
@@ -1606,17 +1678,30 @@ pub(crate) fn path_key(path: &VfsPath) -> String {
     normalize_vfs_path(path).to_string()
 }
 
-fn allocate_shared_file_id() -> FileId {
-    const MAX_ANALYZED_FILE_ID: u32 = 0x007F_FFFF;
+fn allocate_shared_file_id() -> anyhow::Result<FileId> {
+    /// `FileId` wraps a `u32` whose top bit upstream reserves to tell a real
+    /// file apart from a macro-expansion file; `FileId::from_raw` asserts that
+    /// the raw value stays below it. Everything under that bit is ours, so the
+    /// last id we may hand out is `u32::MAX >> 1` (2^31 - 1).
+    const MAX_ANALYZED_FILE_ID: u32 = u32::MAX >> 1;
     static NEXT_FILE_ID: AtomicU32 = AtomicU32::new(0);
 
-    let file_id = NEXT_FILE_ID.fetch_add(1, Ordering::Relaxed);
-    assert!(
-        file_id <= MAX_ANALYZED_FILE_ID,
-        "shared analyzer file id overflowed"
-    );
+    // Ids are never reclaimed, so the counter only ever moves forward. Stop it
+    // at the ceiling instead of letting it wrap: a wrapped counter would alias
+    // ids that are still live and silently corrupt analysis, which is worse
+    // than failing the load that ran out.
+    let file_id = NEXT_FILE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+            (next <= MAX_ANALYZED_FILE_ID).then_some(next + 1)
+        })
+        .map_err(|_| {
+            anyhow::format_err!(
+                "shared analyzer file ids are exhausted: all {} ids are in use",
+                u64::from(MAX_ANALYZED_FILE_ID) + 1
+            )
+        })?;
 
-    FileId::from_raw(file_id)
+    Ok(FileId::from_raw(file_id))
 }
 
 #[derive(Clone, Default)]
@@ -1792,12 +1877,14 @@ impl SessionOverlay {
         }
     }
 
-    pub fn materialize_files(&mut self) {
+    pub fn materialize_files(&mut self) -> anyhow::Result<()> {
         for file in &mut self.files {
             if file.session_file.is_none() {
-                file.session_file = Some(allocate_shared_file_id());
+                file.session_file = Some(allocate_shared_file_id()?);
             }
         }
+
+        Ok(())
     }
 }
 
@@ -2144,12 +2231,26 @@ impl SharedWorld {
             workspace.set_build_scripts(build_scripts);
         }
         let workspace_for_session = workspace.clone();
+        // The allocator upstream hands us must return a `FileId`, so exhaustion
+        // is parked here and raised as soon as the load returns. The stand-in id
+        // only reaches state we are about to drop on the error path.
+        let mut allocation_error = None;
         let loaded = load_workspace_change(
             workspace,
             &config.cargo_config.extra_env,
             &config.load.to_load_cargo_config(),
-            |_| allocate_shared_file_id(),
-        )?;
+            |_| match allocate_shared_file_id() {
+                Ok(file_id) => file_id,
+                Err(error) => {
+                    allocation_error.get_or_insert(error);
+                    FileId::from_raw(0)
+                }
+            },
+        );
+        if let Some(error) = allocation_error {
+            return Err(error);
+        }
+        let loaded = loaded?;
         let files = loaded.vfs.iter().count();
         let line_endings = loaded
             .file_texts
@@ -2756,7 +2857,7 @@ impl SharedWorld {
 
         let mut modified_roots = BTreeSet::new();
         let mut modified_bases = Vec::new();
-        for (_, (_, _, base_file, _, _)) in &open_files {
+        for (_, _, base_file, _, _) in open_files.values() {
             modified_roots.insert(self.source_root_for_file(*base_file)?);
             modified_bases.push(*base_file);
         }
@@ -2793,9 +2894,10 @@ impl SharedWorld {
 
         for (key, (path, display_path, base_file, text, line_endings)) in open_files {
             let previous = old_overlay.files_by_path.get(&key);
-            let overlay_file = previous
-                .map(|file| file.overlay_file)
-                .unwrap_or_else(|| self.allocate_overlay_file_id());
+            let overlay_file = match previous.map(|file| file.overlay_file) {
+                Some(overlay_file) => overlay_file,
+                None => self.allocate_overlay_file_id()?,
+            };
             if previous.is_some_and(|old| old.text != text) {
                 self.applied_overlay_files.remove(&overlay_file);
             }
@@ -2836,9 +2938,10 @@ impl SharedWorld {
                     continue;
                 }
                 let previous = old_overlay.files_by_path.get(&key);
-                let overlay_file = previous
-                    .map(|file| file.overlay_file)
-                    .unwrap_or_else(|| self.allocate_overlay_file_id());
+                let overlay_file = match previous.map(|file| file.overlay_file) {
+                    Some(overlay_file) => overlay_file,
+                    None => self.allocate_overlay_file_id()?,
+                };
                 if previous.is_some_and(|old| old.text != text) {
                     self.applied_overlay_files.remove(&overlay_file);
                 }
@@ -3225,7 +3328,7 @@ impl SharedWorld {
         Ok(graph)
     }
 
-    fn allocate_overlay_file_id(&mut self) -> FileId {
+    fn allocate_overlay_file_id(&mut self) -> anyhow::Result<FileId> {
         allocate_shared_file_id()
     }
 
@@ -3462,7 +3565,7 @@ impl WorkspaceView {
             }
         }
 
-        overlay.materialize_files();
+        overlay.materialize_files()?;
 
         Ok(overlay)
     }
@@ -3491,4 +3594,172 @@ fn package_instance_key(db: &RootDatabase, krate: ide::Crate) -> anyhow::Result<
         is_proc_macro: data.is_proc_macro,
         proc_macro_cwd: format!("{:?}", data.proc_macro_cwd),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_load_key(project: &str) -> SharedAnalyzerWorkspaceLoadKey {
+        SharedAnalyzerWorkspaceLoadKey {
+            world: SharedAnalyzerWorldKey {
+                rust_analyzer_version: RUST_ANALYZER_COMMIT_HASH.to_owned(),
+                toolchain: None,
+                sysroot: None,
+                cargo_target: None,
+                config: SharedAnalyzerWorldConfigKey {
+                    cargo: SharedAnalyzerCargoConfigKey {
+                        all_targets: false,
+                        features: String::new(),
+                        target: None,
+                        sysroot: None,
+                        sysroot_src: None,
+                        rustc_source: None,
+                        extra_includes: Vec::new(),
+                        cfg_overrides: String::new(),
+                        wrap_rustc_in_build_scripts: false,
+                        invocation_strategy: String::new(),
+                        run_build_script_command: String::new(),
+                        extra_args: Vec::new(),
+                        extra_env: Vec::new(),
+                        target_dir_config: String::new(),
+                        set_test: false,
+                        no_deps: false,
+                        metadata_extra_args: Vec::new(),
+                    },
+                },
+                load: SharedAnalyzerLoadKey {
+                    load_out_dirs_from_check: false,
+                    proc_macro_server: SharedAnalyzerProcMacroServerKey::None,
+                    prefill_caches: false,
+                    num_worker_threads: 1,
+                    proc_macro_processes: 0,
+                },
+            },
+            project: project.to_owned(),
+        }
+    }
+
+    fn in_flight_loads(registry: &SharedAnalyzerRegistry) -> usize {
+        registry.state().expect("registry state").loads.len()
+    }
+
+    /// A leader that unwinds must not strand the registry entry: waiters have to
+    /// come back with an error, and the next attempt has to be able to lead a
+    /// fresh load instead of inheriting the dead one.
+    #[test]
+    fn an_unwinding_workspace_load_leader_fails_its_waiters_and_clears_the_registry() {
+        let registry = SharedAnalyzerRegistry::new();
+        let key = workspace_load_key("unwinding-leader");
+
+        let (_leader_load, leader_guard) = registry
+            .begin_workspace_load(key.clone())
+            .expect("registry state");
+        let leader_guard = leader_guard.expect("the first caller leads the load");
+
+        let (follower_load, follower_guard) = registry
+            .begin_workspace_load(key.clone())
+            .expect("registry state");
+        assert!(
+            follower_guard.is_none(),
+            "a second caller must follow the in-flight load, not lead a second one"
+        );
+        assert_eq!(in_flight_loads(&registry), 1);
+
+        let waiter = std::thread::spawn(move || follower_load.wait());
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = leader_guard;
+            panic!("workspace load blew up");
+        }));
+        assert!(unwound.is_err(), "the leader was supposed to unwind");
+
+        let error = waiter
+            .join()
+            .expect("the waiting session must not be left parked")
+            .expect_err("a waiter of an abandoned load must observe an error");
+        assert_eq!(error.to_string(), ABANDONED_WORKSPACE_LOAD);
+
+        assert_eq!(
+            in_flight_loads(&registry),
+            0,
+            "the abandoned load must not stay registered"
+        );
+
+        let (_retry_load, retry_guard) = registry
+            .begin_workspace_load(key)
+            .expect("registry state");
+        assert!(
+            retry_guard.is_some(),
+            "a later attempt must lead a fresh load instead of inheriting the dead one"
+        );
+    }
+
+    /// The ordinary error path: the leader publishes its own failure, so waiters
+    /// see the real reason rather than the guard's fallback, and the entry is
+    /// still gone afterwards.
+    #[test]
+    fn a_failed_workspace_load_leader_publishes_its_error_to_waiters() {
+        let registry = SharedAnalyzerRegistry::new();
+        let key = workspace_load_key("failing-leader");
+
+        let (_leader_load, leader_guard) = registry
+            .begin_workspace_load(key.clone())
+            .expect("registry state");
+        let leader_guard = leader_guard.expect("the first caller leads the load");
+
+        let (follower_load, _) = registry
+            .begin_workspace_load(key.clone())
+            .expect("registry state");
+        let waiter = std::thread::spawn(move || follower_load.wait());
+
+        leader_guard.publish(Err(anyhow::format_err!("workspace metadata is unreadable")));
+
+        let error = waiter
+            .join()
+            .expect("the waiting session must not be left parked")
+            .expect_err("a waiter of a failed load must observe an error");
+        assert_eq!(error.to_string(), "workspace metadata is unreadable");
+
+        assert_eq!(
+            in_flight_loads(&registry),
+            0,
+            "a failed load must not stay registered"
+        );
+
+        let (_retry_load, retry_guard) = registry
+            .begin_workspace_load(key)
+            .expect("registry state");
+        assert!(
+            retry_guard.is_some(),
+            "a later attempt must lead a fresh load instead of inheriting the failed one"
+        );
+    }
+
+    /// The success path stays exactly as it was: the result reaches the waiters
+    /// and the entry is retired without the guard firing.
+    #[test]
+    fn a_successful_workspace_load_leader_publishes_its_index_to_waiters() {
+        let registry = SharedAnalyzerRegistry::new();
+        let key = workspace_load_key("successful-leader");
+
+        let (_leader_load, leader_guard) = registry
+            .begin_workspace_load(key.clone())
+            .expect("registry state");
+        let leader_guard = leader_guard.expect("the first caller leads the load");
+
+        let (follower_load, _) = registry
+            .begin_workspace_load(key)
+            .expect("registry state");
+        let waiter = std::thread::spawn(move || follower_load.wait());
+
+        leader_guard.publish(Ok(7));
+
+        let index = waiter
+            .join()
+            .expect("the waiting session must not be left parked")
+            .expect("a waiter of a successful load must observe the workspace index");
+        assert_eq!(index, 7);
+        assert_eq!(in_flight_loads(&registry), 0);
+    }
 }
